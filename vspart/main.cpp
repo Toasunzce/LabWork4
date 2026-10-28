@@ -6,7 +6,7 @@
 
 
 const int REQUESTS = 30;
-const int HIGH_SHARE = 30;
+const int HIGH_SHARE = 80; // high-%
 const int STAGES = 3;
 const int WORKERS = 2;
 const int SERVICE_MS = 10;
@@ -18,20 +18,20 @@ const int MAX_HIGH_RUN = 3;
 struct Request {
     int id;
     bool high;
-    DWORD enqueuedAt;
-    DWORD waited;
+    double enqueuedAt;
+    double waited;
 };
 
 
 struct Queue {
     CRITICAL_SECTION cs;
-    HANDLE items;               // семафор: сколько заявок в очереди
-    std::deque<Request> q;      // в порядке поступления
-    int highRun;                // сколько HIGH подряд выдано
+    HANDLE items;
+    std::deque<Request> q;
+    int highRun;
 };
 
 
-Queue g_queues[STAGES + 1];     // [0..2] перед ступенями, [3] перед Collector
+Queue g_queues[STAGES + 1];
 CRITICAL_SECTION g_printCs;
 HANDLE g_allDone;
 DWORD g_start;
@@ -44,8 +44,16 @@ void Log(const std::string& s) {
 }
 
 
+double NowMs() {
+    static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart * 1000.0 / freq.QuadPart;
+}
+
+
 void Push(Queue& Q, Request r) {
-    r.enqueuedAt = GetTickCount();
+    r.enqueuedAt = NowMs();
     EnterCriticalSection(&Q.cs);
     Q.q.push_back(r);
     LeaveCriticalSection(&Q.cs);
@@ -57,16 +65,22 @@ bool Pop(Queue& Q, Request& out) {
     WaitForSingleObject(Q.items, INFINITE);
     EnterCriticalSection(&Q.cs);
 
-    if (Q.q.empty()) {          // разбудили для завершения
+    if (Q.q.empty()) {
         LeaveCriticalSection(&Q.cs);
         return false;
     }
 
-    auto it = Q.q.begin();      // режим FIFO: самая старая заявка
+    auto it = Q.q.begin();
     if (PRIORITY_MODE) {
-        auto high = std::find_if(Q.q.begin(), Q.q.end(), [](const Request& r) { return r.high; });
-        auto normal = std::find_if(Q.q.begin(), Q.q.end(), [](const Request& r) { return !r.high; });
-        bool takeNormal = (high == Q.q.end()) || (Q.highRun >= MAX_HIGH_RUN && normal != Q.q.end());
+        auto high = std::find_if(
+            Q.q.begin(), Q.q.end(), [](const Request& r) { return r.high; }
+        );
+        auto normal = std::find_if(
+            Q.q.begin(), Q.q.end(), [](const Request& r) { return !r.high; }
+        );
+        bool takeNormal = (
+            high == Q.q.end()) || (Q.highRun >= MAX_HIGH_RUN && normal != Q.q.end()
+        );
         it = takeNormal ? normal : high;
         Q.highRun = it->high ? Q.highRun + 1 : 0;
     }
@@ -74,7 +88,7 @@ bool Pop(Queue& Q, Request& out) {
     Q.q.erase(it);
     LeaveCriticalSection(&Q.cs);
 
-    out.waited += GetTickCount() - out.enqueuedAt;
+    out.waited += NowMs() - out.enqueuedAt;
     return true;
 }
 
@@ -101,7 +115,7 @@ DWORD WINAPI Worker(LPVOID p) {
         Log("STAGE " + std::to_string(a->stage + 1) + " W" + std::to_string(a->id) +
             " TID=" + std::to_string(GetCurrentThreadId()) +
             " REQ " + std::to_string(r.id) + (r.high ? " HIGH" : " NORMAL"));
-        Sleep(SERVICE_MS);                  // имитация обработки
+        Sleep(SERVICE_MS);
         Push(g_queues[a->stage + 1], r);
     }
     return 0;
@@ -110,7 +124,7 @@ DWORD WINAPI Worker(LPVOID p) {
 
 DWORD WINAPI Collector(LPVOID) {
     int done = 0, cnt[2] = { 0, 0 };
-    DWORD wait[2] = { 0, 0 };
+    double wait[2] = { 0, 0 };
     Request r;
     while (Pop(g_queues[STAGES], r)) {
         int k = r.high ? 1 : 0;
@@ -119,8 +133,8 @@ DWORD WINAPI Collector(LPVOID) {
         done++;
         if (done == REQUESTS) {
             Log("DONE: " + std::to_string(done) + " requests");
-            Log("avg wait HIGH   = " + std::to_string(cnt[1] ? wait[1] / cnt[1] : 0) + " ms");
-            Log("avg wait NORMAL = " + std::to_string(cnt[0] ? wait[0] / cnt[0] : 0) + " ms");
+            Log("avg wait HIGH   = " + std::to_string(cnt[1] ? wait[1] / cnt[1] : 0.0) + " ms");
+            Log("avg wait NORMAL = " + std::to_string(cnt[0] ? wait[0] / cnt[0] : 0.0) + " ms");
             SetEvent(g_allDone);
         }
     }
@@ -154,7 +168,6 @@ int main() {
 
     WaitForSingleObject(g_allDone, 60000);
 
-    // завершение: будим всех ожидающих на семафорах, они увидят пустую очередь
     for (int i = 0; i <= STAGES; i++)
         ReleaseSemaphore(g_queues[i].items, WORKERS, NULL);
     WaitForMultipleObjects(N, threads, TRUE, 5000);
