@@ -1,0 +1,20 @@
+@startuml
+skinparam shadowing false
+
+rectangle "Generator" as GEN
+rectangle "Очередь\n(защищена Critical Section)" as Q {
+  queue "HIGH" as QH
+  queue "NORMAL" as QN
+}
+rectangle "Semaphore" as SEM
+rectangle "Workers" as W
+rectangle "Collector\n(логирование,\n статистика)" as COL
+
+GEN --> QH : HIGH
+GEN --> QN : NORMAL
+GEN --> SEM : заявка добавлена
+SEM ..> W : есть заявка
+QH --> W
+QN --> W
+W --> COL
+@enduml

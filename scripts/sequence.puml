@@ -1,0 +1,17 @@
+@startuml
+skinparam shadowing false
+
+participant Generator
+participant "Очередь\n(Critical Section)" as Q
+participant Semaphore as SEM
+participant Worker as W
+participant Collector
+
+Generator -> Q : добавить заявку (HIGH/NORMAL)
+Generator -> SEM : Release (+1)
+
+W -> SEM : Wait
+W -> Q : взять заявку (сначала HIGH)
+W -> Collector : обработанная заявка
+Collector -> Collector : лог и статистика
+@enduml
