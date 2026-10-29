@@ -1,10 +1,13 @@
 #include <windows.h>
+#include <mmsystem.h>
 #include <iostream>
 #include <cstdio>
 #include <string>
 #include <cstdlib>
 #include <deque>
 #include <algorithm>
+
+#pragma comment(lib, "winmm.lib")
 
 
 const int STAGES = 3;
@@ -28,6 +31,7 @@ struct Request {
     double enqueuedAt;
     double waited;
     unsigned long long seq;
+    double service;
 };
 
 
@@ -43,11 +47,24 @@ struct Queue {
 };
 
 
+struct Stats {
+    int completed[2];
+    double wait[2];
+    double maxWait[2];
+    double service[2];
+    double totalMs;
+};
+
+
 Queue g_queues[STAGES + 1];
 CRITICAL_SECTION g_printCs;
 HANDLE g_allDone = NULL;
 HANDLE g_stop = NULL;
 volatile LONG g_failed = 0;
+volatile LONG g_created = 0;
+volatile LONG g_rejected = 0;
+Stats g_stats;
+double g_busyMs[STAGES * MAX_WORKERS];
 double g_startMs;
 
 
@@ -66,6 +83,13 @@ void Print(const std::string& s) {
 }
 
 
+std::string Fmt(double v) {
+    char b[32];
+    sprintf_s(b, "%.2f", v);
+    return b;
+}
+
+
 bool ParseArgs(int argc, char* argv[]) {
     if ((argc - 1) % 2 != 0) {
         Print("Error: every parameter needs a value\n");
@@ -76,7 +100,14 @@ bool ParseArgs(int argc, char* argv[]) {
         std::string val = argv[i + 1];
         int n = atoi(val.c_str());
 
-        if (key == "--mode") PRIORITY_MODE = (val != "fifo");
+        if (key == "--mode") {
+            if (val == "fifo") PRIORITY_MODE = false;
+            else if (val == "priority") PRIORITY_MODE = true;
+            else {
+                Print("Error: --mode must be fifo or priority\n");
+                return false;
+            }
+        }
         else if (key == "--high-share") HIGH_SHARE = n;
         else if (key == "--requests") REQUESTS = n;
         else if (key == "--workers") WORKERS = n;
@@ -220,6 +251,7 @@ DWORD WINAPI Generator(LPVOID) {
         Request r = { i, rand() % 100 < HIGH_SHARE, 0, 0 };
         Log(tag, "CREATED", ReqStr(r));
         if (!Push(g_queues[0], r)) break;
+        InterlockedIncrement(&g_created);
         if (!Delay(INTERVAL_MS)) break;
     }
     Log(tag, "STATE=FINISHED");
@@ -238,9 +270,14 @@ DWORD WINAPI Worker(LPVOID p) {
         if (!Pop(g_queues[a->stage], r)) break;
 
         Log(tag, "STATE=WORKING", ReqStr(r));
+        double t0 = NowMs();
         if (!Delay(SERVICE_MS)) break;
-        if (!Push(g_queues[a->stage + 1], r)) break;
+        double spent = NowMs() - t0;
+        r.service += spent;
+        g_busyMs[uid - 1] += spent;
+
         Log(tag, "PASSED", ReqStr(r));
+        if (!Push(g_queues[a->stage + 1], r)) break;
     }
     Log(tag, "STATE=FINISHED");
     return 0;
@@ -249,8 +286,7 @@ DWORD WINAPI Worker(LPVOID p) {
 
 DWORD WINAPI Collector(LPVOID) {
     std::string tag = Tag("COLLECTOR", 1);
-    int done = 0, cnt[2] = { 0, 0 };
-    double wait[2] = { 0, 0 };
+    int done = 0;
     Request r;
     while (true) {
         Log(tag, "STATE=WAITING");
@@ -258,15 +294,14 @@ DWORD WINAPI Collector(LPVOID) {
 
         Log(tag, "RECEIVED", ReqStr(r));
         int k = r.high ? 1 : 0;
-        cnt[k]++;
-        wait[k] += r.waited;
+        g_stats.completed[k]++;
+        g_stats.wait[k] += r.waited;
+        g_stats.service[k] += r.service;
+        if (r.waited > g_stats.maxWait[k]) g_stats.maxWait[k] = r.waited;
         done++;
+
         if (done == REQUESTS) {
-            Log(tag, "RESULT", "completed=" + std::to_string(done), true);
-            Log(tag, "RESULT", "avg wait HIGH   = " +
-                std::to_string(cnt[1] ? wait[1] / cnt[1] : 0.0) + " ms", true);
-            Log(tag, "RESULT", "avg wait NORMAL = " +
-                std::to_string(cnt[0] ? wait[0] / cnt[0] : 0.0) + " ms", true);
+            g_stats.totalMs = NowMs() - g_startMs;
             if (!SetEvent(g_allDone)) {
                 PrintError("SetEvent(allDone)");
                 Abort();
@@ -321,6 +356,39 @@ void Cleanup() {
 }
 
 
+void PrintStats() {
+    int created = (int)g_created;
+    int rejected = (int)g_rejected;
+    int done = g_stats.completed[0] + g_stats.completed[1];
+    double sec = g_stats.totalMs / 1000.0;
+
+    std::string s = "\n=== STATISTICS ===\n";
+    s += "created=" + std::to_string(created) +
+        " completed=" + std::to_string(done) +
+        " rejected=" + std::to_string(rejected) + "\n";
+    s += std::string("check created == completed + rejected: ") +
+        (created == done + rejected ? "OK" : "FAIL") + "\n";
+    s += "total time=" + Fmt(g_stats.totalMs) + " ms, throughput=" +
+        Fmt(sec > 0 ? done / sec : 0.0) + " req/s\n";
+
+    for (int k = 1; k >= 0; k--) {
+        int n = g_stats.completed[k];
+        s += std::string(k ? "HIGH   " : "NORMAL ") + ": n=" + std::to_string(n) +
+            " | avg wait=" + Fmt(n ? g_stats.wait[k] / n : 0.0) + " ms" +
+            " | max wait=" + Fmt(g_stats.maxWait[k]) + " ms" +
+            " | avg service=" + Fmt(n ? g_stats.service[k] / n : 0.0) + " ms\n";
+    }
+
+    for (int st = 0; st < STAGES; st++) {
+        double busy = 0;
+        for (int w = 0; w < WORKERS; w++) busy += g_busyMs[st * WORKERS + w];
+        double load = g_stats.totalMs > 0 ? busy / (WORKERS * g_stats.totalMs) * 100.0 : 0.0;
+        s += "stage " + std::to_string(st + 1) + " load=" + Fmt(load) + " %\n";
+    }
+    Print(s);
+}
+
+
 int main(int argc, char* argv[]) {
 
     InitializeCriticalSection(&g_printCs);
@@ -328,6 +396,10 @@ int main(int argc, char* argv[]) {
         DeleteCriticalSection(&g_printCs);
         return 2;
     }
+
+    bool timerSet = (timeBeginPeriod(1) == TIMERR_NOERROR);
+    if (!timerSet) Print("Warning: timeBeginPeriod(1) failed, delays will be coarse\n");
+
     g_startMs = NowMs();
     std::string mainTag = "MAIN | PID=" + std::to_string(GetCurrentProcessId());
     Log(mainTag, "CONFIG",
@@ -393,15 +465,17 @@ int main(int argc, char* argv[]) {
     }
 
     bool failed = (g_failed != 0);
+    if (joined && !failed) PrintStats();
     Log(mainTag, "FINISHED", std::string("status=") + (failed ? "ERROR" : "OK"), true);
 
     if (joined) {
         Cleanup();
         DeleteCriticalSection(&g_printCs);
     }
+    if (timerSet) timeEndPeriod(1);
     return failed ? 1 : 0;
 }
 
 
 // parameters: --mode fifo --high-share 70 --requests 910 --seed 8954 --verbose 0
-// 
+//
