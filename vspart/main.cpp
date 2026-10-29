@@ -2,20 +2,24 @@
 #include <iostream>
 #include <cstdio>
 #include <string>
+#include <cstdlib>
 #include <deque>
 #include <algorithm>
 
 
-const int REQUESTS = 30;
-const int HIGH_SHARE = 80; // high-%
 const int STAGES = 3;
-const int WORKERS = 2;
-const int SERVICE_MS = 10;
-const int INTERVAL_MS = 2;
-const bool PRIORITY_MODE = true;
 const int MAX_HIGH_RUN = 3;
-const bool VERBOSE = true;
+const int MAX_WORKERS = 20;
 const DWORD JOIN_TIMEOUT_MS = 5000;
+
+int REQUESTS = 500;
+int HIGH_SHARE = 20;
+int WORKERS = 2;
+int SERVICE_MS = 10;
+int INTERVAL_MS = 2;
+int SEED = 1000;
+bool PRIORITY_MODE = true;
+bool VERBOSE = true;
 
 
 struct Request {
@@ -23,14 +27,18 @@ struct Request {
     bool high;
     double enqueuedAt;
     double waited;
+    unsigned long long seq;
 };
 
 
 struct Queue {
     CRITICAL_SECTION cs;
     bool csReady;
+    bool stageQueue;
     HANDLE items;
-    std::deque<Request> q;
+    std::deque<Request> high;
+    std::deque<Request> normal;
+    unsigned long long nextSeq;
     int highRun;
 };
 
@@ -58,6 +66,37 @@ void Print(const std::string& s) {
 }
 
 
+bool ParseArgs(int argc, char* argv[]) {
+    if ((argc - 1) % 2 != 0) {
+        Print("Error: every parameter needs a value\n");
+        return false;
+    }
+    for (int i = 1; i < argc; i += 2) {
+        std::string key = argv[i];
+        std::string val = argv[i + 1];
+        int n = atoi(val.c_str());
+
+        if (key == "--mode") PRIORITY_MODE = (val != "fifo");
+        else if (key == "--high-share") HIGH_SHARE = n;
+        else if (key == "--requests") REQUESTS = n;
+        else if (key == "--workers") WORKERS = n;
+        else if (key == "--seed") SEED = n;
+        else if (key == "--service-ms") SERVICE_MS = n;
+        else if (key == "--interval-ms") INTERVAL_MS = n;
+        else if (key == "--verbose") VERBOSE = (n != 0);
+        else {
+            Print("Error: unknown parameter " + key + "\n");
+            return false;
+        }
+    }
+    if (WORKERS < 1 || WORKERS > MAX_WORKERS) {
+        Print("Error: workers must be 1.." + std::to_string(MAX_WORKERS) + "\n");
+        return false;
+    }
+    return true;
+}
+
+
 void PrintError(const std::string& op) {
     DWORD statusCode = GetLastError();
     char formatedMsg[256] = "";
@@ -73,7 +112,6 @@ void PrintError(const std::string& op) {
 }
 
 
-// Фиксирует сбой и останавливает всех участников
 void Abort() {
     InterlockedExchange(&g_failed, 1);
     if (g_stop) SetEvent(g_stop);
@@ -119,7 +157,8 @@ bool Delay(DWORD ms) {
 bool Push(Queue& Q, Request r) {
     r.enqueuedAt = NowMs();
     EnterCriticalSection(&Q.cs);
-    Q.q.push_back(r);
+    r.seq = Q.nextSeq++;
+    (r.high ? Q.high : Q.normal).push_back(r);
     LeaveCriticalSection(&Q.cs);
     if (!ReleaseSemaphore(Q.items, 1, NULL)) {
         PrintError("ReleaseSemaphore");
@@ -141,32 +180,31 @@ bool Pop(Queue& Q, Request& out) {
     }
 
     EnterCriticalSection(&Q.cs);
-    if (Q.q.empty()) {
+    if (Q.high.empty() && Q.normal.empty()) {
         LeaveCriticalSection(&Q.cs);
         Print("Error: queue is empty after semaphore wait\n");
         Abort();
         return false;
     }
 
-    auto it = Q.q.begin();
-    if (PRIORITY_MODE) {
-        auto high = std::find_if(
-            Q.q.begin(), Q.q.end(), [](const Request& r) { return r.high; }
-        );
-        auto normal = std::find_if(
-            Q.q.begin(), Q.q.end(), [](const Request& r) { return !r.high; }
-        );
-        bool takeNormal = (
-            high == Q.q.end()) || (Q.highRun >= MAX_HIGH_RUN && normal != Q.q.end()
-                );
-        it = takeNormal ? normal : high;
-        Q.highRun = it->high ? Q.highRun + 1 : 0;
-    }
-    out = *it;
-    Q.q.erase(it);
+    bool usePriority = PRIORITY_MODE && Q.stageQueue;
+    std::deque<Request>* src;
+    if (Q.normal.empty())
+        src = &Q.high;
+    else if (Q.high.empty())
+        src = &Q.normal;
+    else if (usePriority)
+        src = (Q.highRun >= MAX_HIGH_RUN) ? &Q.normal : &Q.high;
+    else
+        src = (Q.high.front().seq < Q.normal.front().seq) ? &Q.high : &Q.normal;
+
+    if (usePriority) Q.highRun = (src == &Q.high) ? Q.highRun + 1 : 0;
+    out = src->front();
+    src->pop_front();
     LeaveCriticalSection(&Q.cs);
 
-    out.waited += NowMs() - out.enqueuedAt;
+    if (Q.stageQueue) out.waited += NowMs() - out.enqueuedAt;
+
     return true;
 }
 
@@ -177,7 +215,7 @@ struct WorkerArg { int stage; int id; };
 DWORD WINAPI Generator(LPVOID) {
     std::string tag = Tag("GENERATOR", 1);
     Log(tag, "STATE=WORKING");
-    srand(1000);
+    srand(SEED);
     for (int i = 1; i <= REQUESTS; i++) {
         Request r = { i, rand() % 100 < HIGH_SHARE, 0, 0 };
         Log(tag, "CREATED", ReqStr(r));
@@ -241,7 +279,6 @@ DWORD WINAPI Collector(LPVOID) {
 }
 
 
-// Создание объектов синхронизации. При ошибке возвращает false, остальное освобождает Cleanup.
 bool InitSync() {
     g_stop = CreateEventA(NULL, TRUE, FALSE, NULL);
     if (!g_stop) {
@@ -260,7 +297,9 @@ bool InitSync() {
     for (int i = 0; i <= STAGES; i++) {
         InitializeCriticalSection(&g_queues[i].cs);
         g_queues[i].csReady = true;
+        g_queues[i].stageQueue = (i < STAGES);
         g_queues[i].highRun = 0;
+        g_queues[i].nextSeq = 0;
         g_queues[i].items = CreateSemaphoreA(NULL, 0, LONG_MAX, NULL);
         if (!g_queues[i].items) {
             PrintError("CreateSemaphore(queue " + std::to_string(i) + ")");
@@ -282,15 +321,26 @@ void Cleanup() {
 }
 
 
-int main() {
+int main(int argc, char* argv[]) {
+
     InitializeCriticalSection(&g_printCs);
+    if (!ParseArgs(argc, argv)) {
+        DeleteCriticalSection(&g_printCs);
+        return 2;
+    }
     g_startMs = NowMs();
     std::string mainTag = "MAIN | PID=" + std::to_string(GetCurrentProcessId());
-    Log(mainTag, "STARTED");
+    Log(mainTag, "CONFIG",
+        std::string("mode=") + (PRIORITY_MODE ? "priority" : "fifo") +
+        " high-share=" + std::to_string(HIGH_SHARE) +
+        " requests=" + std::to_string(REQUESTS) +
+        " workers=" + std::to_string(WORKERS) +
+        " seed=" + std::to_string(SEED) +
+        " service-ms=" + std::to_string(SERVICE_MS) +
+        " interval-ms=" + std::to_string(INTERVAL_MS), true);
 
-    const int N = 2 + STAGES * WORKERS;
-    HANDLE threads[N];
-    WorkerArg args[STAGES * WORKERS];
+    HANDLE threads[2 + STAGES * MAX_WORKERS];
+    WorkerArg args[STAGES * MAX_WORKERS];
     int n = 0;
     bool joined = true;
 
@@ -351,3 +401,7 @@ int main() {
     }
     return failed ? 1 : 0;
 }
+
+
+// parameters: --mode fifo --high-share 70 --requests 910 --seed 8954 --verbose 0
+// 
