@@ -2,9 +2,11 @@
 #include <mmsystem.h>
 #include <iostream>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <cstdlib>
 #include <deque>
+#include <vector>
 #include <algorithm>
 
 #pragma comment(lib, "winmm.lib")
@@ -21,8 +23,11 @@ int WORKERS = 2;
 int SERVICE_MS = 10;
 int INTERVAL_MS = 2;
 int SEED = 1000;
+int RUNS = 1;
 bool PRIORITY_MODE = true;
 bool VERBOSE = true;
+
+int g_curSeed = 1000;
 
 
 struct Request {
@@ -90,6 +95,14 @@ std::string Fmt(double v) {
 }
 
 
+std::string CsvNum(double v) {
+    char b[32];
+    if (v == (double)(long long)v) sprintf_s(b, "%lld", (long long)v);
+    else sprintf_s(b, "%.3f", v);
+    return b;
+}
+
+
 bool ParseArgs(int argc, char* argv[]) {
     if ((argc - 1) % 2 != 0) {
         Print("Error: every parameter needs a value\n");
@@ -114,6 +127,7 @@ bool ParseArgs(int argc, char* argv[]) {
         else if (key == "--seed") SEED = n;
         else if (key == "--service-ms") SERVICE_MS = n;
         else if (key == "--interval-ms") INTERVAL_MS = n;
+        else if (key == "--runs") RUNS = n;
         else if (key == "--verbose") VERBOSE = (n != 0);
         else {
             Print("Error: unknown parameter " + key + "\n");
@@ -122,6 +136,10 @@ bool ParseArgs(int argc, char* argv[]) {
     }
     if (WORKERS < 1 || WORKERS > MAX_WORKERS) {
         Print("Error: workers must be 1.." + std::to_string(MAX_WORKERS) + "\n");
+        return false;
+    }
+    if (RUNS < 1) {
+        Print("Error: runs must be at least 1\n");
         return false;
     }
     return true;
@@ -246,7 +264,7 @@ struct WorkerArg { int stage; int id; };
 DWORD WINAPI Generator(LPVOID) {
     std::string tag = Tag("GENERATOR", 1);
     Log(tag, "STATE=WORKING");
-    srand(SEED);
+    srand(g_curSeed);
     for (int i = 1; i <= REQUESTS; i++) {
         Request r = { i, rand() % 100 < HIGH_SHARE, 0, 0 };
         Log(tag, "CREATED", ReqStr(r));
@@ -335,6 +353,8 @@ bool InitSync() {
         g_queues[i].stageQueue = (i < STAGES);
         g_queues[i].highRun = 0;
         g_queues[i].nextSeq = 0;
+        g_queues[i].high.clear();
+        g_queues[i].normal.clear();
         g_queues[i].items = CreateSemaphoreA(NULL, 0, LONG_MAX, NULL);
         if (!g_queues[i].items) {
             PrintError("CreateSemaphore(queue " + std::to_string(i) + ")");
@@ -356,65 +376,12 @@ void Cleanup() {
 }
 
 
-void PrintStats() {
-    int created = (int)g_created;
-    int rejected = (int)g_rejected;
-    int done = g_stats.completed[0] + g_stats.completed[1];
-    double sec = g_stats.totalMs / 1000.0;
-
-    std::string s = "\n=== STATISTICS ===\n";
-    s += "created=" + std::to_string(created) +
-        " completed=" + std::to_string(done) +
-        " rejected=" + std::to_string(rejected) + "\n";
-    s += std::string("check created == completed + rejected: ") +
-        (created == done + rejected ? "OK" : "FAIL") + "\n";
-    s += "total time=" + Fmt(g_stats.totalMs) + " ms, throughput=" +
-        Fmt(sec > 0 ? done / sec : 0.0) + " req/s\n";
-
-    for (int k = 1; k >= 0; k--) {
-        int n = g_stats.completed[k];
-        s += std::string(k ? "HIGH   " : "NORMAL ") + ": n=" + std::to_string(n) +
-            " | avg wait=" + Fmt(n ? g_stats.wait[k] / n : 0.0) + " ms" +
-            " | max wait=" + Fmt(g_stats.maxWait[k]) + " ms" +
-            " | avg service=" + Fmt(n ? g_stats.service[k] / n : 0.0) + " ms\n";
-    }
-
-    for (int st = 0; st < STAGES; st++) {
-        double busy = 0;
-        for (int w = 0; w < WORKERS; w++) busy += g_busyMs[st * WORKERS + w];
-        double load = g_stats.totalMs > 0 ? busy / (WORKERS * g_stats.totalMs) * 100.0 : 0.0;
-        s += "stage " + std::to_string(st + 1) + " load=" + Fmt(load) + " %\n";
-    }
-    Print(s);
-}
-
-
-int main(int argc, char* argv[]) {
-
-    InitializeCriticalSection(&g_printCs);
-    if (!ParseArgs(argc, argv)) {
-        DeleteCriticalSection(&g_printCs);
-        return 2;
-    }
-
-    bool timerSet = (timeBeginPeriod(1) == TIMERR_NOERROR);
-    if (!timerSet) Print("Warning: timeBeginPeriod(1) failed, delays will be coarse\n");
-
-    g_startMs = NowMs();
-    std::string mainTag = "MAIN | PID=" + std::to_string(GetCurrentProcessId());
-    Log(mainTag, "CONFIG",
-        std::string("mode=") + (PRIORITY_MODE ? "priority" : "fifo") +
-        " high-share=" + std::to_string(HIGH_SHARE) +
-        " requests=" + std::to_string(REQUESTS) +
-        " workers=" + std::to_string(WORKERS) +
-        " seed=" + std::to_string(SEED) +
-        " service-ms=" + std::to_string(SERVICE_MS) +
-        " interval-ms=" + std::to_string(INTERVAL_MS), true);
+bool RunOnce(bool& joined) {
+    joined = true;
 
     HANDLE threads[2 + STAGES * MAX_WORKERS];
     WorkerArg args[STAGES * MAX_WORKERS];
     int n = 0;
-    bool joined = true;
 
     if (InitSync()) {
         auto start = [&](LPTHREAD_START_ROUTINE fn, LPVOID arg) -> bool {
@@ -464,18 +431,175 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < n; i++) CloseHandle(threads[i]);
     }
 
-    bool failed = (g_failed != 0);
-    if (joined && !failed) PrintStats();
+    return g_failed == 0;
+}
+
+
+std::vector<std::string> MetricNames() {
+    std::vector<std::string> n = {
+        "created", "completed", "rejected", "check_ok", "total_ms", "throughput",
+        "high_n", "high_avg_wait", "high_max_wait", "high_avg_service",
+        "normal_n", "normal_avg_wait", "normal_max_wait", "normal_avg_service"
+    };
+    for (int st = 1; st <= STAGES; st++) n.push_back("load_stage" + std::to_string(st));
+    return n;
+}
+
+
+std::vector<double> CollectResult() {
+    int created = (int)g_created;
+    int rejected = (int)g_rejected;
+    int done = g_stats.completed[0] + g_stats.completed[1];
+    double sec = g_stats.totalMs / 1000.0;
+
+    std::vector<double> v;
+    v.push_back(created);
+    v.push_back(done);
+    v.push_back(rejected);
+    v.push_back(created == done + rejected ? 1 : 0);
+    v.push_back(g_stats.totalMs);
+    v.push_back(sec > 0 ? done / sec : 0.0);
+
+    for (int k = 1; k >= 0; k--) {
+        int n = g_stats.completed[k];
+        v.push_back(n);
+        v.push_back(n ? g_stats.wait[k] / n : 0.0);
+        v.push_back(g_stats.maxWait[k]);
+        v.push_back(n ? g_stats.service[k] / n : 0.0);
+    }
+
+    for (int st = 0; st < STAGES; st++) {
+        double busy = 0;
+        for (int w = 0; w < WORKERS; w++) busy += g_busyMs[st * WORKERS + w];
+        v.push_back(g_stats.totalMs > 0 ? busy / (WORKERS * g_stats.totalMs) * 100.0 : 0.0);
+    }
+    return v;
+}
+
+
+double Median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    size_t n = v.size();
+    return (n % 2) ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
+}
+
+
+void PrintSummary(const std::vector<std::vector<double>>& all) {
+    std::vector<std::string> names = MetricNames();
+    std::string s = "\n=== SUMMARY over " + std::to_string(all.size()) + " runs ===\n";
+    for (size_t m = 0; m < names.size(); m++) {
+        std::vector<double> col;
+        double sum = 0;
+        for (size_t r = 0; r < all.size(); r++) {
+            col.push_back(all[r][m]);
+            sum += all[r][m];
+        }
+        s += names[m] + ": avg=" + Fmt(sum / col.size()) + " median=" + Fmt(Median(col)) + "\n";
+    }
+    Print(s);
+}
+
+
+int main(int argc, char* argv[]) {
+
+    InitializeCriticalSection(&g_printCs);
+    if (!ParseArgs(argc, argv)) {
+        DeleteCriticalSection(&g_printCs);
+        return 2;
+    }
+
+    if (!CreateDirectoryA("data", NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        PrintError("CreateDirectory(data)");
+        DeleteCriticalSection(&g_printCs);
+        return 1;
+    }
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char stamp[32];
+    sprintf_s(stamp, "%04d%02d%02d_%02d%02d%02d",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::string path = std::string("data\\") + (PRIORITY_MODE ? "priority" : "fifo") +
+        "_h" + std::to_string(HIGH_SHARE) + "_n" + std::to_string(REQUESTS) +
+        "_" + stamp + ".csv";
+
+    FILE* csv = NULL;
+    if (fopen_s(&csv, path.c_str(), "w") != 0 || !csv) {
+        Print("Error: cannot open " + path + "\n");
+        DeleteCriticalSection(&g_printCs);
+        return 1;
+    }
+    std::string header;
+    std::vector<std::string> names = MetricNames();
+    for (size_t i = 0; i < names.size(); i++) header += (i ? "," : "") + names[i];
+    fprintf(csv, "%s\n", header.c_str());
+    fflush(csv);
+
+    bool timerSet = (timeBeginPeriod(1) == TIMERR_NOERROR);
+    if (!timerSet) Print("Warning: timeBeginPeriod(1) failed, delays will be coarse\n");
+
+    std::string mainTag = "MAIN | PID=" + std::to_string(GetCurrentProcessId());
+    g_startMs = NowMs();
+    Log(mainTag, "CONFIG",
+        std::string("mode=") + (PRIORITY_MODE ? "priority" : "fifo") +
+        " high-share=" + std::to_string(HIGH_SHARE) +
+        " requests=" + std::to_string(REQUESTS) +
+        " workers=" + std::to_string(WORKERS) +
+        " seed=" + std::to_string(SEED) +
+        " service-ms=" + std::to_string(SERVICE_MS) +
+        " interval-ms=" + std::to_string(INTERVAL_MS) +
+        " runs=" + std::to_string(RUNS), true);
+    Log(mainTag, "OUTPUT", path, true);
+
+    std::vector<std::vector<double>> all;
+    bool failed = false;
+    bool joined = true;
+
+    for (int run = 1; run <= RUNS; run++) {
+        memset(&g_stats, 0, sizeof(g_stats));
+        memset(g_busyMs, 0, sizeof(g_busyMs));
+        g_created = 0;
+        g_rejected = 0;
+        g_failed = 0;
+        g_curSeed = SEED + run - 1;
+        g_startMs = NowMs();
+
+        bool ok = RunOnce(joined);
+        if (!joined) {
+            failed = true;
+            break;
+        }
+        Cleanup();
+        if (!ok) {
+            failed = true;
+            break;
+        }
+
+        std::vector<double> v = CollectResult();
+        std::string row;
+        for (size_t i = 0; i < v.size(); i++) row += (i ? "," : "") + CsvNum(v[i]);
+        fprintf(csv, "%s\n", row.c_str());
+        fflush(csv);
+        all.push_back(v);
+
+        Print("run " + std::to_string(run) + "/" + std::to_string(RUNS) +
+            ": total=" + Fmt(v[4]) + " ms, check=" + (v[3] == 1 ? "OK" : "FAIL") + "\n");
+    }
+
+    fclose(csv);
+    if (!failed) PrintSummary(all);
     Log(mainTag, "FINISHED", std::string("status=") + (failed ? "ERROR" : "OK"), true);
 
-    if (joined) {
-        Cleanup();
-        DeleteCriticalSection(&g_printCs);
-    }
+    if (joined) DeleteCriticalSection(&g_printCs);
     if (timerSet) timeEndPeriod(1);
     return failed ? 1 : 0;
 }
 
 
-// parameters: --mode fifo --high-share 70 --requests 910 --seed 8954 --verbose 0
-//
+// parameters: --mode fifo --high-share 70 --requests 910 --seed 8954 --runs 100 --verbose 0
+/*
+TODO: remove irrelevant metrics such as load_stage_1, etc
+      push to git
+      do experiments
+      build graphics
+      write report
+*/

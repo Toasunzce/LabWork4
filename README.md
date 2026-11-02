@@ -27,12 +27,27 @@ FIFO и приоритетный (не более трёх HIGH подряд п�
 | `--service-ms` | длительность обработки заявки на ступени, мс | 10 |
 | `--interval-ms` | интервал между заявками генератора, мс | 2 |
 | `--verbose` | подробный журнал событий (0 отключает вывод для измерений) | 1 |
+| `--runs` | число итераций для подсчета статистики | 1 |
+
+### Пример запуска:
+```bash
+lab04.exe --mode fifo --high-share 70 --runs 100 --verbose 0
+```
 
 ## Проведение эксперимента
 
 1. Стандартные параметры: 500 заявок, 2 потока на ступень, режимы `fifo` и `priority`,
-   доля HIGH 20% и 70%, по 3 запуска каждой конфигурации.
+   доля HIGH 20% и 70%, по **100** запусков каждой конфигурации.
+```bash
+lab04.exe --mode fifo --high-share 20 --runs 100 --verbose 0
+lab04.exe --mode fifo --high-share 70 --runs 100 --verbose 0
+lab04.exe --mode priority --high-share 20 --runs 100 --verbose 0
+lab04.exe --mode priority --high-share 70 --runs 100 --verbose 0
+```
 2. Индивидуальные параметры. STUDENT_ID это последние 3 цифры студбилета:
    `SEED = 1000 + STUDENT_ID * 97`, `OPERATIONS = 500 + STUDENT_ID * 5`.
+```bash
+lab04.exe --mode fifo --seed 8954 --requests 910
+```
 3. Построение графиков по данным из `data\`.
 
