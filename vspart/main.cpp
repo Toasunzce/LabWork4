@@ -588,18 +588,8 @@ int main(int argc, char* argv[]) {
     fclose(csv);
     if (!failed) PrintSummary(all);
     Log(mainTag, "FINISHED", std::string("status=") + (failed ? "ERROR" : "OK"), true);
-
+ 
     if (joined) DeleteCriticalSection(&g_printCs);
     if (timerSet) timeEndPeriod(1);
     return failed ? 1 : 0;
 }
-
-
-// parameters: --mode fifo --high-share 70 --requests 910 --seed 8954 --runs 100 --verbose 0
-/*
-TODO: remove irrelevant metrics such as load_stage_1, etc
-      push to git
-      do experiments
-      build graphics
-      write report
-*/

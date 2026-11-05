@@ -1,2 +1,0 @@
-created,completed,rejected,check_ok,total_ms,throughput,high_n,high_avg_wait,high_max_wait,high_avg_service,normal_n,normal_avg_wait,normal_max_wait,normal_avg_service,load_stage1,load_stage2,load_stage3
-500,500,0,1,2639.834,189.406,97,5.311,17.119,31.037,403,834.733,1360.529,31.287,98.672,98.569,98.593
